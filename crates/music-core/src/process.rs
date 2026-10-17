@@ -12,9 +12,12 @@
 //!
 //! Linux has no job objects. There the answer is `PR_SET_PDEATHSIG`, set in the
 //! forked child before it execs; see `configure_child_process` in
-//! `music-engine`'s `yue_server`. This module's `adopt` therefore does nothing
-//! off Windows - it is the spawn-side hook, not this one, that keeps a Linux
-//! engine from being orphaned.
+//! `music-engine`'s `yue_server`.
+//!
+//! macOS has neither, and had nothing at all until `adopt` gained a path for
+//! it: a `yue-server` started there outlived a quit and kept the graphics card
+//! and the engine port. It is a detached watcher process now, described on
+//! `watcher` below.
 
 use std::process::Child;
 
@@ -36,7 +39,41 @@ pub fn adopt(child: &Child) {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub fn adopt(child: &Child) {
+    watcher(child.id());
+}
+
+/// macOS has neither a job object nor a parent-death signal, so this leaves a
+/// small detached `sh` behind to do the watching. It is a child of ours, so
+/// when we end - killed, crashed, quit - it is reparented to launchd and keeps
+/// running, notices our pid is gone, and ends the engine.
+///
+/// It watches the child too, so it exits by itself when the engine stops
+/// normally and never accumulates: one watcher per engine run, and it has
+/// finished by the time the next one starts.
+#[cfg(target_os = "macos")]
+fn watcher(child_pid: u32) {
+    let parent = std::process::id();
+    // Both conditions, so an ordinary stop ends the loop; the kill only
+    // happens when it was *we* who went. TERM first: the engine closes its
+    // port on the way out. After that it is in the way, so KILL.
+    let script = format!(
+        "while kill -0 {parent} 2>/dev/null && kill -0 {child_pid} 2>/dev/null; do sleep 1; done; \
+         if ! kill -0 {parent} 2>/dev/null; then \
+           kill -TERM {child_pid} 2>/dev/null; sleep 2; kill -KILL {child_pid} 2>/dev/null; \
+         fi"
+    );
+    let _ = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub fn adopt(_child: &Child) {}
 
 /// Wires up the spawn so the child cannot outlive this process.

@@ -303,6 +303,11 @@ fn quit_now(app: &tauri::AppHandle, running: Vec<String>) {
         let _ = service_call("POST", &format!("/v1/music/jobs/{id}"), Duration::from_secs(5));
     }
     let _ = service_call("POST", "/v1/hub/flush", Duration::from_secs(10));
+    // Last, and before the process goes: the engine's supervisor would stop it
+    // from its destructor, but `exit` ends the process without dropping the
+    // runtime that holds it. Without this the engine outlived the studio on
+    // macOS, keeping the graphics card and port 18087 until killed by hand.
+    let _ = service_call("POST", "/v1/engine/stop", Duration::from_secs(15));
     app.exit(0);
 }
 

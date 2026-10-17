@@ -98,6 +98,15 @@ struct AppState {
     /// Why the engine last failed to come up with a complete set on disk, for the setup page.
     engine_start_error: Arc<RwLock<Option<String>>>,
     active_device: Arc<RwLock<Option<music_engine::yue_server::ComputeBackend>>>,
+    /// Set while this service is itself stopping or restarting the engine. The
+    /// health watchdog cannot tell a stop it asked for from a card that died:
+    /// both leave the port silent and a clean log. Without this, switching a
+    /// model set - an ordinary, deliberate restart - was read as a device
+    /// failure and the card was condemned for the rest of the session.
+    engine_stop_intent: Arc<std::sync::atomic::AtomicBool>,
+    /// Set once the studio is going away, so the health watchdog does not bring
+    /// the engine back up after the shutdown stopped it on purpose.
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
     /// The CUDA libraries the engine binary imports. They are downloaded, not
     /// installed, so the engine cannot start until they are on disk.
     engine_runtime: Arc<engine_runtime::EngineRuntime>,
@@ -980,6 +989,8 @@ pub async fn serve() -> anyhow::Result<()> {
         failed_devices: Arc::new(RwLock::new(Vec::new())),
         engine_start_error: Arc::new(RwLock::new(None)),
         active_device: Arc::new(RwLock::new(None)),
+        engine_stop_intent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         assistant: Arc::new(RwLock::new(persisted.as_ref().map(|settings| settings.assistant.clone()).unwrap_or_default())),
         assistant_runtime: Arc::new(assistant_runtime::AssistantRuntime::new(
             &studio_data_root().unwrap_or_else(|| std::path::PathBuf::from(".")),
@@ -1027,6 +1038,7 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/engine/options", get(engine_options).put(update_engine_options))
         .route("/engine/pick-executable", post(pick_engine_executable))
         .route("/engine/restart", post(restart_local_engine))
+        .route("/v1/engine/stop", post(stop_local_engine))
         .route("/v1/engine/logs", get(engine_logs))
         .route("/v1/engine/progress", get(engine_progress))
         .route("/v1/system/resources", get(system_resources))
@@ -1246,7 +1258,13 @@ pub async fn serve() -> anyhow::Result<()> {
                 // holding it is left alone, and the engine comes back after
                 let preparing = state.prepare.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().is_some_and(|job| !job.finished);
                 let card_taken = preparing || state.training.active_run().await.is_some();
-                if ready && !running && !card_taken {
+                // A stop this service asked for is not a crash. While a restart
+                // is under way the port is briefly silent and the log is clean,
+                // which is exactly what a silently dead card looks like - so the
+                // whole block below is skipped rather than read as a failure.
+                let stopping_on_purpose = state.engine_stop_intent.load(std::sync::atomic::Ordering::SeqCst)
+                    || state.shutting_down.load(std::sync::atomic::Ordering::SeqCst);
+                if ready && !running && !card_taken && !stopping_on_purpose {
                     if was_running {
                         // It was answering and now it is not: the one line that
                         // explains a log which suddenly starts again from
@@ -1258,9 +1276,22 @@ pub async fn serve() -> anyhow::Result<()> {
                         let active = *state.active_device.read().await;
                         if let Some(device) = active.filter(|device| auto && *device != music_engine::yue_server::ComputeBackend::Cpu) {
                             let log = last_run_log().to_lowercase();
-                            if describes_device_failure(&log) || died_silently(&log) {
+                            // Only a fault the device names is proof. A clean log
+                            // looks identical whether the card died or this
+                            // service simply stopped the engine a moment before
+                            // the watchdog looked - which is what an ordinary
+                            // restart does, and each one used to condemn the card
+                            // for the rest of the session, silently and with an
+                            // eight-fold slowdown. A device that fails without a
+                            // word is still restarted below, just not blacklisted;
+                            // if it keeps failing, the start error is shown.
+                            if describes_device_failure(&log) {
                                 music_engine::yue_server::note_in_log(&format!("{} failed on this machine; leaving it for this session", device_name(device)));
                                 state.failed_devices.write().await.push(device);
+                            } else if died_silently(&log) {
+                                // Worth a line, not a verdict: the engine goes
+                                // back on the same device.
+                                music_engine::yue_server::note_in_log(&format!("{} stopped without a fault of its own; trying it again", device_name(device)));
                             }
                         }
                     }
@@ -4206,6 +4237,27 @@ async fn restart_local_engine(State(state): State<AppState>) -> Result<Json<Valu
     Ok(Json(serde_json::json!({ "engine_id": PRIMARY_MUSIC_ENGINE_ID, "restarted": true })))
 }
 
+/// Stops the engine this service owns, and keeps it stopped.
+///
+/// Called on the way out. The supervisor stops the engine from its destructor,
+/// but that only covers an orderly unwind: the studio leaves through
+/// `AppHandle::exit`, and the runtime holding the supervisor is never dropped,
+/// so the child outlived it and held the graphics card and the engine port
+/// until something killed it by hand. Windows has a job object that ends the
+/// group whatever happens; this is the macOS path doing it deliberately.
+async fn stop_local_engine(State(state): State<AppState>) -> Json<Value> {
+    state.shutting_down.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut supervisor = state.engine.lock().await;
+    let stopped = match supervisor.as_mut() {
+        Some(engine) => tokio::task::block_in_place(|| engine.stop(std::time::Duration::from_secs(10))).is_ok(),
+        None => true,
+    };
+    *supervisor = None;
+    drop(supervisor);
+    *state.active_device.write().await = None;
+    Json(serde_json::json!({ "engine_id": PRIMARY_MUSIC_ENGINE_ID, "stopped": stopped }))
+}
+
 /// Opens the native file picker for an engine executable. The window is a
 /// browser and cannot open one itself, so the studio picks on its behalf and
 /// hands the path back; nothing changes until the user saves the options, the
@@ -4228,7 +4280,17 @@ async fn pick_engine_executable() -> Result<Json<Value>, (StatusCode, Json<ApiEr
     })))
 }
 
+/// Marks the engine as being stopped on purpose for the length of a restart.
+/// The flag is cleared on every path, including the early returns, so a failed
+/// restart never leaves the watchdog blind to a real crash.
 async fn restart_engine(state: &AppState) -> Result<(), String> {
+    state.engine_stop_intent.store(true, std::sync::atomic::Ordering::SeqCst);
+    let result = restart_engine_inner(state).await;
+    state.engine_stop_intent.store(false, std::sync::atomic::Ordering::SeqCst);
+    result
+}
+
+async fn restart_engine_inner(state: &AppState) -> Result<(), String> {
     let mut supervisor = state.engine.lock().await;
     let owned = supervisor.is_some();
     if let Some(engine) = supervisor.as_mut() {
@@ -4287,7 +4349,7 @@ async fn restart_engine(state: &AppState) -> Result<(), String> {
             .resolve(models)
             .map_err(|error| format!("the local engine runtime was not found: {error}"))?;
         let mut engine = music_engine::yue_server::YueServerSupervisor::new(config).map_err(|error| error.to_string())?;
-        match tokio::task::block_in_place(|| engine.ensure_started(std::time::Duration::from_secs(60))) {
+        match tokio::task::block_in_place(|| engine.ensure_started(engine_readiness_timeout())) {
             Ok(_) => {
                 *supervisor = Some(engine);
                 *state.active_device.write().await = Some(device);
@@ -4317,6 +4379,14 @@ async fn restart_engine(state: &AppState) -> Result<(), String> {
         }
     }
     Err(last_error)
+}
+
+/// How long a cold start may take before it counts as the device's failure.
+/// Apple Silicon pays for a Metal shader library compiled the first time an
+/// engine binary runs, on top of a multi-gigabyte weight load, so one blanket
+/// minute was tight enough to be mistaken for a device that would not start.
+fn engine_readiness_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(if cfg!(target_os = "macos") { 180 } else { 60 })
 }
 
 /// The device's name as the settings show it.
@@ -8597,6 +8667,12 @@ fn output_format(settings: &Value) -> &str {
     settings.get("output_format").and_then(Value::as_str).unwrap_or("flac")
 }
 
+/// The solver used when a request does not name one. `midpoint` is the
+/// engine's reference; `ab2` is the same tune for half the evaluations.
+fn default_solver() -> &'static str {
+    if cfg!(target_os = "macos") { "ab2" } else { "midpoint" }
+}
+
 fn validate_solver(solver: &str) -> Result<(), String> {
     if matches!(solver, "midpoint" | "ab2") { Ok(()) } else { Err("solver must be midpoint or ab2".into()) }
 }
@@ -8735,9 +8811,22 @@ fn yue_request_from(request: &CreateMusicJobRequest, max_batch: u32) -> Result<V
     body["lm_seed"] = Value::from(request.lm_seed.filter(|seed| *seed >= 0).unwrap_or_else(drawn_seed));
     body["seed"] = Value::from(request.seed.filter(|seed| *seed >= 0).unwrap_or_else(drawn_seed));
     insert_optional(&mut body, "steps", request.steps);
-    if let Some(solver) = request.solver.as_deref() {
-        validate_solver(solver)?;
-        body["solver"] = Value::from(solver);
+    // The engine's own default is `midpoint`: two network evaluations a step.
+    // `ab2` spends one for the same result, and the acoustic stage is where a
+    // song's time goes - 421 s of 540 s on an M4 Pro. Apple Silicon is the
+    // machine that most wants the cheap solver: Metal has no tensor path before
+    // M5, so the card is doing the work the slow way already. Named only when it
+    // says something the engine would not have assumed, so a request that sets
+    // nothing still travels as the fields it always did.
+    match request.solver.as_deref() {
+        Some(solver) => {
+            validate_solver(solver)?;
+            body["solver"] = Value::from(solver);
+        }
+        None if default_solver() != "midpoint" => {
+            body["solver"] = Value::from(default_solver());
+        }
+        None => {}
     }
     insert_optional(&mut body, "lm_batch_size", request.lm_batch_size);
     insert_optional(&mut body, "synth_batch_size", request.synth_batch_size);
@@ -9233,7 +9322,16 @@ mod tests {
         // the seeds are drawn here when left out, so the song can be made again
         let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
         keys.sort();
-        assert_eq!(keys, ["lm_seed", "lyrics", "seed", "style"], "only style, lyrics and the drawn seeds travel when nothing else was set: {body}");
+        // Apple Silicon names `ab2` for the song even when the form sets nothing:
+        // the engine's own default, `midpoint`, costs twice the evaluations in
+        // the stage that dominates a song's time there. Elsewhere the request
+        // stays the three fields it always was.
+        let expected: &[&str] = if cfg!(target_os = "macos") {
+            &["lm_seed", "lyrics", "seed", "solver", "style"]
+        } else {
+            &["lm_seed", "lyrics", "seed", "style"]
+        };
+        assert_eq!(keys, expected, "only style, lyrics, the drawn seeds and any non-default solver travel: {body}");
         assert_eq!(body["lyrics"], "[Verse]\none line");
     }
 
